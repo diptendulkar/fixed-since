@@ -46,6 +46,19 @@ class Release:
     published_at: datetime
 
 
+@dataclass(frozen=True)
+class ChangedFile:
+    path: str
+    # None when GitHub omits the patch: binary files and very large diffs.
+    patch: str | None
+
+
+def tls_context() -> ssl.SSLContext:
+    """The OS trust store, so a corporate TLS-inspecting proxy's CA is honoured
+    the same way the browser honours it."""
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -91,14 +104,12 @@ class GitHubClient:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        # The OS trust store, so a corporate TLS-inspecting proxy's CA is honoured
-        # the same way the browser honours it.
         self._http = httpx.Client(
             base_url=API_URL,
             headers=headers,
             timeout=30.0,
             transport=transport,
-            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+            verify=tls_context(),
         )
         self._releases: list[Release] | None = None
 
@@ -174,6 +185,12 @@ class GitHubClient:
             merged_at=parse_time(data["merged_at"]),
             merge_commit_sha=data.get("merge_commit_sha"),
         )
+
+    def pull_files(self, number: int) -> list[ChangedFile]:
+        return [
+            ChangedFile(path=item["filename"], patch=item.get("patch"))
+            for item in self._paginate(f"/repos/{self.repo}/pulls/{number}/files")
+        ]
 
     def search_merged_prs(
         self, terms: list[str], merged_after: datetime, limit: int = 5

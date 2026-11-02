@@ -1,6 +1,6 @@
 [project]
 name = "fixed-since"
-version = "0.1.0"
+version = "0.2.0"
 description = "Find open GitHub issues that a later merged PR already fixed, and draft a cited reply for a maintainer to review."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -30,6 +30,27 @@ fixed-since scan OWNER/NAME --limit 20       # the 20 oldest open issues
 fixed-since scan OWNER/NAME --no-search      # linked pull requests only, no title search
 ```
 
+## Checking the diff with a model (optional)
+
+Wording is only a first filter: pull request descriptions overclaim. With `--verify`, a model reads each promising pull request's diff and says whether it **addresses** the issue, addresses it **partially**, is **unrelated**, or whether it's **unsure**.
+
+```bash
+# Any Chat Completions API: OpenAI, OpenRouter, or a local model via Ollama / LM Studio / vLLM
+OPENAI_BASE_URL=http://localhost:11434/v1 fixed-since check OWNER/NAME 68 --verify openai --model qwen2.5-coder
+
+ANTHROPIC_API_KEY=... fixed-since scan OWNER/NAME --verify anthropic --model <model>
+
+# See exactly what would be sent, without calling any model
+fixed-since check OWNER/NAME 68 --show-prompt
+```
+
+What the model can and can't do:
+
+- **It can lower a draft, but can't raise one to "fixed".** "Unrelated" removes the draft from a pull request that says "Fixes #N". The furthest it can lift a title-search match is a question to the reporter, never a claim that the issue is fixed.
+- **Unsupported answers count as "unsure".** Not citing a changed file, citing a file that isn't in the diff, or giving malformed JSON all fall back to the wording-based result.
+- **The code goes first.** Large diffs are trimmed to fit: source files go in smallest first, then tests, then docs, with lockfiles and generated files last. A source file that doesn't fit is truncated rather than dropped. The prompt lists everything it left out, so the model knows what it hasn't seen.
+- Only the three strongest candidates per issue are checked, and never mentions or pull requests overruled by a reopen.
+
 ## How it works
 
 1. **Linked pull requests.** Reads the issue's timeline for merged pull requests in the same repository that reference it and were merged after it was opened.
@@ -49,12 +70,12 @@ Scanning the 25 oldest open issues of a large open-source agent platform turned 
 ## Limitations
 
 - Each issue costs several API calls (timeline, each linked pull request, release comparisons), so a scan of 25 issues takes about a minute. The title search uses GitHub's search API, which allows 30 requests a minute.
-- Reference grading reads wording, not code. It's a filter that decides what's worth a human's time, not a verdict.
+- Without `--verify`, reference grading reads wording, not code. It's a filter that decides what's worth a human's time, not a verdict. With `--verify`, a model's verdict is still for the maintainer to weigh, which is why it's shown next to the draft rather than hidden in it.
+- `--verify` sends issue text, PR descriptions and diffs to the model provider you choose. For a private repository, use a local model.
 
 ## Roadmap
 
 - GitHub Discussions (Q&A) as well as issues
-- An LLM check that reads the candidate diff and the issue, and says whether the change addresses the reported cause, or declines to say
 - A GitHub Action that posts the report as a weekly maintainer digest, still never replying on its own
 - Flag accidental closing keywords, such as "which closed #123" in a PR description
 

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fixed_since.github import GitHubClient, Issue, PullRequest, Release, parse_time
+from fixed_since.verify import Verdict
 
 Evidence = Literal["claims-fix", "partial", "title-search", "reopened-after", "mention"]
 
@@ -41,6 +42,8 @@ class Candidate:
     pull: PullRequest
     evidence: Evidence
     release: Release | None
+    # Set when a model has read the diff; None when unchecked.
+    verdict: Verdict | None = None
 
 
 def classify_reference(text: str, issue_number: int) -> Evidence:
