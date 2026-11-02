@@ -4,12 +4,12 @@ from typing import Any
 
 import httpx
 import pytest
+from fakes import REPO, FakeGitHub
 
 from fixed_since.draft import draft_reply, render_report
 from fixed_since.finder import classify_reference, find_candidates, salient_terms
 from fixed_since.github import GitHubClient, GitHubError
 
-REPO = "acme/widget"
 ISSUE_OPENED = "2026-06-01T00:00:00Z"
 MERGED = "2026-08-20T00:00:00Z"
 
@@ -54,30 +54,6 @@ def _release(tag: str, published_at: str, *, prerelease: bool = False) -> dict[s
         "draft": False,
         "prerelease": prerelease,
     }
-
-
-class FakeGitHub:
-    """Serves canned responses by path and records every request it gets."""
-
-    def __init__(self, routes: dict[str, Any]) -> None:
-        self.routes = routes
-        self.requests: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        path = request.url.path
-        if path not in self.routes:
-            return httpx.Response(404, json={"message": f"no route for {path}"})
-        body = self.routes[path]
-        if isinstance(body, list) and request.url.params.get("page", "1") != "1":
-            body = []
-        return httpx.Response(200, json=body)
-
-    def client(self) -> GitHubClient:
-        return GitHubClient(REPO, token="t", transport=httpx.MockTransport(self))
-
-    def searched(self) -> bool:
-        return any(r.url.path == "/search/issues" for r in self.requests)
 
 
 def _routes(search: list[int] | None = None, **extra: Any) -> dict[str, Any]:
@@ -222,8 +198,9 @@ def test_a_mere_mention_still_triggers_the_title_search() -> None:
     fake.routes["/search/issues"] = {"items": [{"number": 20}, {"number": 10}]}
     found = [(c.pull.number, c.evidence) for c in _candidates(fake)]
     assert found == [(20, "title-search"), (10, "mention")]
-    query = next(r for r in fake.requests if r.url.path == "/search/issues").url.params["q"]
+    (query,) = fake.search_queries()
     assert f"repo:{REPO}" in query and "merged:>2026-06-01" in query and "is:merged" in query
+    assert "in:title" in query
 
 
 def test_release_is_the_first_published_after_the_merge_that_contains_it() -> None:

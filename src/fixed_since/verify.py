@@ -26,7 +26,7 @@ MIN_TRUNCATED_PATCH_CHARS = 1_000
 
 # Only these are worth paying a model to check; mentions and pull requests
 # superseded by a reopen are already ruled out.
-VERIFIABLE = ("claims-fix", "partial", "title-search")
+VERIFIABLE = ("claims-fix", "partial", "title-search", "model-search")
 
 SYSTEM_PROMPT = """\
 You check whether a merged pull request fixes a reported GitHub issue.
@@ -70,6 +70,58 @@ class VerifyRequest:
 
 class Verifier(Protocol):
     def verify(self, request: VerifyRequest) -> Verdict: ...
+
+
+class QueryPlanner(Protocol):
+    def suggest_queries(self, issue: Issue) -> list[str]: ...
+
+
+class Model(Verifier, QueryPlanner, Protocol):
+    """What --verify configures: one model that both checks diffs and plans searches."""
+
+
+QUERY_SYSTEM_PROMPT = """\
+A user reported a problem. Somebody may since have fixed it in a pull request
+whose title uses different words: a user says "dark mode resets every time I
+open the app", a fix says "persist theme preference".
+
+Suggest up to 3 searches for that pull request's title. Each is 2 or 3 plain
+words a developer would put in the title of the fix, not words from the
+report. Answer with a JSON array of strings and nothing else, for example:
+["persist theme", "theme preference"]"""
+
+MAX_QUERIES = 3
+MAX_QUERY_WORDS = 3
+
+
+def build_query_prompt(issue: Issue) -> str:
+    return f"## {issue.title}\n\n{_clip(issue.body, MAX_ISSUE_CHARS) or '(no description)'}"
+
+
+def parse_queries(text: str) -> list[str]:
+    """Plain-word queries from the model's answer.
+
+    Only letters, digits, ``_`` and ``-`` survive, so a model can't widen a
+    search with qualifiers such as ``repo:`` or ``is:open``.
+    """
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match is None:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    queries: list[str] = []
+    for item in data:
+        if not isinstance(item, str):
+            continue
+        words = [w for w in item.split() if re.fullmatch(r"[A-Za-z0-9_\-]+", w)]
+        query = " ".join(words[:MAX_QUERY_WORDS]).lower()
+        if query and query not in queries:
+            queries.append(query)
+    return queries[:MAX_QUERIES]
 
 
 def _clip(text: str, limit: int) -> str:
@@ -177,7 +229,24 @@ def _post(http: httpx.Client, url: str, body: dict[str, Any]) -> Any:
     return response.json()
 
 
-class OpenAICompatibleVerifier:
+class _ChatModel:
+    """A model behind an HTTP API; subclasses supply one request/response shape."""
+
+    def _complete(self, system: str, user: str) -> str | None:
+        raise NotImplementedError
+
+    def verify(self, request: VerifyRequest) -> Verdict:
+        text = self._complete(SYSTEM_PROMPT, build_prompt(request))
+        if text is None:
+            return Verdict("unsure", "model response had no text content")
+        return parse_verdict(text, request.changed_paths)
+
+    def suggest_queries(self, issue: Issue) -> list[str]:
+        text = self._complete(QUERY_SYSTEM_PROMPT, build_query_prompt(issue))
+        return parse_queries(text or "")
+
+
+class OpenAICompatibleVerifier(_ChatModel):
     """Any Chat Completions API: OpenAI, OpenRouter, Ollama, LM Studio, vLLM."""
 
     def __init__(
@@ -194,7 +263,7 @@ class OpenAICompatibleVerifier:
             headers=headers, timeout=120.0, transport=transport, verify=tls_context()
         )
 
-    def verify(self, request: VerifyRequest) -> Verdict:
+    def _complete(self, system: str, user: str) -> str | None:
         payload = _post(
             self._http,
             self._url,
@@ -202,19 +271,18 @@ class OpenAICompatibleVerifier:
                 "model": self.model,
                 "temperature": 0,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": build_prompt(request)},
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
                 ],
             },
         )
         try:
-            text = payload["choices"][0]["message"]["content"]
+            return str(payload["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError):
-            return Verdict("unsure", "model response had no message content")
-        return parse_verdict(str(text), request.changed_paths)
+            return None
 
 
-class AnthropicVerifier:
+class AnthropicVerifier(_ChatModel):
     def __init__(
         self,
         model: str,
@@ -231,7 +299,7 @@ class AnthropicVerifier:
             verify=tls_context(),
         )
 
-    def verify(self, request: VerifyRequest) -> Verdict:
+    def _complete(self, system: str, user: str) -> str | None:
         payload = _post(
             self._http,
             self._url,
@@ -239,17 +307,16 @@ class AnthropicVerifier:
                 "model": self.model,
                 "max_tokens": 500,
                 "temperature": 0,
-                "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": build_prompt(request)}],
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
             },
         )
         try:
-            text = "".join(
+            return "".join(
                 block["text"] for block in payload["content"] if block.get("type") == "text"
             )
         except (KeyError, TypeError, AttributeError):
-            return Verdict("unsure", "model response had no text content")
-        return parse_verdict(text, request.changed_paths)
+            return None
 
 
 class PromptPrinter:
@@ -265,6 +332,13 @@ class PromptPrinter:
         )
         return Verdict("unsure", "not checked: --show-prompt printed the prompt instead")
 
+    def suggest_queries(self, issue: Issue) -> list[str]:
+        self._stream.write(
+            f"\n===== search-query prompt for #{issue.number} =====\n[system]\n"
+            f"{QUERY_SYSTEM_PROMPT}\n\n[user]\n{build_query_prompt(issue)}\n"
+        )
+        return []
+
 
 def verify_candidates(
     client: GitHubClient,
@@ -272,14 +346,20 @@ def verify_candidates(
     candidates: list[Candidate],
     verifier: Verifier,
     *,
-    max_per_issue: int = 3,
+    max_per_evidence: int = 2,
 ) -> list[Candidate]:
-    """Attach a verdict to the strongest few candidates worth checking."""
-    checked = 0
+    """Attach a verdict to the strongest few candidates of each kind.
+
+    Capped per kind of evidence rather than overall, so noisy title-search
+    matches can't use up the checks before a model-suggested search's
+    matches get any.
+    """
+    checked: dict[str, int] = {}
     result: list[Candidate] = []
     for candidate in candidates:
-        if candidate.evidence in VERIFIABLE and checked < max_per_issue:
-            checked += 1
+        count = checked.get(candidate.evidence, 0)
+        if candidate.evidence in VERIFIABLE and count < max_per_evidence:
+            checked[candidate.evidence] = count + 1
             request = VerifyRequest(issue, candidate.pull, client.pull_files(candidate.pull.number))
             candidate = replace(candidate, verdict=verifier.verify(request))
         result.append(candidate)

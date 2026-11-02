@@ -11,9 +11,9 @@ from fixed_since.finder import find_candidates
 from fixed_since.github import GitHubClient, GitHubError, resolve_token
 from fixed_since.verify import (
     AnthropicVerifier,
+    Model,
     OpenAICompatibleVerifier,
     PromptPrinter,
-    Verifier,
     VerifierError,
     verify_candidates,
 )
@@ -29,13 +29,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    check = commands.add_parser("check", help="check one issue")
+    check = commands.add_parser("check", help="check one issue or discussion")
     check.add_argument("repo", help="OWNER/NAME")
-    check.add_argument("issue", type=int, help="issue number")
+    check.add_argument("issue", type=int, help="issue or discussion number")
+    check.add_argument(
+        "--discussion", action="store_true", help="the number is a discussion, not an issue"
+    )
 
     scan = commands.add_parser("scan", help="check the oldest open issues")
     scan.add_argument("repo", help="OWNER/NAME")
-    scan.add_argument("--limit", type=int, default=20, help="issues to check (default 20)")
+    scan.add_argument("--limit", type=int, default=20, help="how many to check (default 20)")
+    scan.add_argument(
+        "--discussions",
+        action="store_true",
+        help="scan unanswered Q&A discussions instead of open issues",
+    )
 
     for command in (check, scan):
         command.add_argument(
@@ -47,9 +55,10 @@ def _parser() -> argparse.ArgumentParser:
             "--verify",
             choices=("openai", "anthropic"),
             help=(
-                "have a model read each promising pull request's diff. 'openai' is any "
-                "Chat Completions API (OPENAI_API_KEY, OPENAI_BASE_URL for Ollama, "
-                "OpenRouter, vLLM...); 'anthropic' uses ANTHROPIC_API_KEY"
+                "have a model suggest title searches and read each promising pull "
+                "request's diff. 'openai' is any Chat Completions API (OPENAI_API_KEY, "
+                "OPENAI_BASE_URL for Ollama, OpenRouter, vLLM...); 'anthropic' uses "
+                "ANTHROPIC_API_KEY"
             ),
         )
         command.add_argument("--model", help="model name for --verify")
@@ -61,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _verifier(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Verifier | None:
+def _model(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Model | None:
     if args.show_prompt:
         return PromptPrinter()
     if args.verify is None:
@@ -82,18 +91,24 @@ def _verifier(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Veri
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    verifier = _verifier(parser, args)
+    model = _model(parser, args)
     try:
         with GitHubClient(args.repo, token=resolve_token()) as client:
-            if args.command == "check":
+            if args.command == "check" and args.discussion:
+                issues = [client.get_discussion(args.issue)]
+            elif args.command == "check":
                 issues = [client.get_issue(args.issue)]
+            elif args.discussions:
+                issues = client.list_unanswered_discussions(args.limit)
             else:
                 issues = client.list_open_issues(args.limit)
             results = []
             for issue in issues:
-                candidates = find_candidates(client, issue, search=not args.no_search)
-                if verifier is not None:
-                    candidates = verify_candidates(client, issue, candidates, verifier)
+                candidates = find_candidates(
+                    client, issue, search=not args.no_search, planner=model
+                )
+                if model is not None:
+                    candidates = verify_candidates(client, issue, candidates, model)
                 results.append((issue, candidates))
     except (GitHubError, VerifierError, ValueError) as exc:
         print(f"fixed-since: {exc}", file=sys.stderr)

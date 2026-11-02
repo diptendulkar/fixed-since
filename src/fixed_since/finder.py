@@ -8,18 +8,24 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fixed_since.github import GitHubClient, Issue, PullRequest, Release, parse_time
-from fixed_since.verify import Verdict
+from fixed_since.verify import QueryPlanner, Verdict
 
-Evidence = Literal["claims-fix", "partial", "title-search", "reopened-after", "mention"]
+Evidence = Literal[
+    "claims-fix", "partial", "title-search", "model-search", "reopened-after", "mention"
+]
 
 # Strongest first; candidates are sorted by this.
 EVIDENCE_ORDER: tuple[Evidence, ...] = (
     "claims-fix",
     "partial",
     "title-search",
+    "model-search",
     "reopened-after",
     "mention",
 )
+
+# Found by searching rather than by a link; only ever drafted as a question.
+SEARCH_EVIDENCE: tuple[Evidence, ...] = ("title-search", "model-search")
 
 _FIX_WORDS = r"(?:fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved)"
 _PARTIAL_WORDS = (
@@ -107,35 +113,52 @@ def first_release_containing(client: GitHubClient, pull: PullRequest) -> Release
     return None
 
 
-def find_candidates(client: GitHubClient, issue: Issue, *, search: bool = True) -> list[Candidate]:
+def find_candidates(
+    client: GitHubClient,
+    issue: Issue,
+    *,
+    search: bool = True,
+    planner: QueryPlanner | None = None,
+) -> list[Candidate]:
     """Merged pull requests that may fix ``issue``, strongest evidence first.
 
-    Pull requests that link to the issue are checked first. A title search
-    runs only when none of them claims to fix or advance it, because a search
-    match is much noisier. A pull request merged before the issue was last
-    reopened is known not to have been enough, whatever it claims.
+    Pull requests that link to the issue are checked first. Searches run only
+    when none of them claims to fix or advance it, because a search match is
+    much noisier: first the issue title's own words, then, given a
+    ``planner``, the words a model expects the fix's title to use. A pull
+    request merged before the issue was last reopened is known not to have
+    been enough, whatever it claims.
+
+    Discussions have no timeline, so for them only the searches run.
     """
-    events = client.timeline(issue.number)
-    reopened = last_reopened(events)
     found: list[tuple[PullRequest, Evidence]] = []
-    for number in linked_pull_numbers(events, client.repo):
-        pull = client.get_merged_pull(number)
-        if pull is None or pull.merged_at <= issue.created_at:
-            continue
-        if reopened is not None and pull.merged_at <= reopened:
-            found.append((pull, "reopened-after"))
-        else:
-            found.append((pull, classify_reference(f"{pull.title}\n{pull.body}", issue.number)))
+    if issue.kind == "issue":
+        events = client.timeline(issue.number)
+        reopened = last_reopened(events)
+        for number in linked_pull_numbers(events, client.repo):
+            pull = client.get_merged_pull(number)
+            if pull is None or pull.merged_at <= issue.created_at:
+                continue
+            if reopened is not None and pull.merged_at <= reopened:
+                found.append((pull, "reopened-after"))
+            else:
+                text = f"{pull.title}\n{pull.body}"
+                found.append((pull, classify_reference(text, issue.number)))
 
     if search and not any(evidence in ("claims-fix", "partial") for _, evidence in found):
-        terms = salient_terms(issue.title)
         known = {pull.number for pull, _ in found}
-        if terms:
-            found.extend(
-                (pull, "title-search")
-                for pull in client.search_merged_prs(terms, issue.created_at)
-                if pull.number not in known
-            )
+
+        def add(terms: list[str], evidence: Evidence) -> None:
+            for pull in client.search_merged_prs(terms, issue.created_at):
+                if pull.number not in known:
+                    known.add(pull.number)
+                    found.append((pull, evidence))
+
+        if terms := salient_terms(issue.title):
+            add(terms, "title-search")
+        if planner is not None:
+            for query in planner.suggest_queries(issue):
+                add(query.split(), "model-search")
 
     found.sort(key=lambda item: EVIDENCE_ORDER.index(item[1]))
     return [

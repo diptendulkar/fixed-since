@@ -1,6 +1,6 @@
 # fixed-since
 
-Find open GitHub issues that a later merged pull request already fixed, and draft a reply that cites the evidence, for a maintainer to review.
+Find open GitHub issues and unanswered discussions that a later merged pull request already fixed, and draft a reply that cites the evidence, for a maintainer to review.
 
 Large projects collect issues whose cause was fixed months ago. Nobody tells the person who reported it: the fix landed under a different issue, or the PR never mentioned theirs. The issue stays open, the reporter assumes it's still broken, and drive-by replies guess at an answer.
 
@@ -25,14 +25,20 @@ It authenticates with `GITHUB_TOKEN` / `GH_TOKEN`, or with your GitHub CLI login
 ## Usage
 
 ```bash
-fixed-since check OWNER/NAME 68              # one issue
-fixed-since scan OWNER/NAME --limit 20       # the 20 oldest open issues
-fixed-since scan OWNER/NAME --no-search      # linked pull requests only, no title search
+fixed-since check OWNER/NAME 68                # one issue
+fixed-since scan OWNER/NAME --limit 20         # the 20 oldest open issues
+fixed-since scan OWNER/NAME --no-search        # linked pull requests only, no title search
+fixed-since check OWNER/NAME 1566 --discussion # one discussion
+fixed-since scan OWNER/NAME --discussions      # the oldest unanswered Q&A discussions
 ```
+
+Discussions are read through GitHub's GraphQL API, and only from categories that accept an answer, so announcements and roadmap threads are skipped. Pull requests can't link to a discussion the way they link to an issue, so for discussions every match comes from searching, and is never drafted without `--verify`.
 
 ## Checking the diff with a model (optional)
 
 Wording is only a first filter: pull request descriptions overclaim. With `--verify`, a model reads each promising pull request's diff and says whether it **addresses** the issue, addresses it **partially**, is **unrelated**, or whether it's **unsure**.
+
+It also suggests up to three title searches. A report describes the symptom ("the worker needs `login` again after a few hours"); the fix's title names the mechanism ("refresh grant for hosts"). The issue's own words often find nothing: on a large open-source agent platform, none of the 8 oldest unanswered discussions got a single title match. Suggested searches are limited to two or three plain words each, so a model can't add search qualifiers, and their matches are weak evidence like any other search match.
 
 ```bash
 # Any Chat Completions API: OpenAI, OpenRouter, or a local model via Ollama / LM Studio / vLLM
@@ -49,13 +55,13 @@ What the model can and can't do:
 - **It can lower a draft, but can't raise one to "fixed".** "Unrelated" removes the draft from a pull request that says "Fixes #N". The furthest it can lift a title-search match is a question to the reporter, never a claim that the issue is fixed.
 - **Unsupported answers count as "unsure".** Not citing a changed file, citing a file that isn't in the diff, or giving malformed JSON all fall back to the wording-based result.
 - **The code goes first.** Large diffs are trimmed to fit: source files go in smallest first, then tests, then docs, with lockfiles and generated files last. A source file that doesn't fit is truncated rather than dropped. The prompt lists everything it left out, so the model knows what it hasn't seen.
-- Only the three strongest candidates per issue are checked, and never mentions or pull requests overruled by a reopen.
+- At most two candidates of each kind are checked per issue, so a page of noisy title matches can't use up the checks before the model's own searches get any. Mentions and pull requests overruled by a reopen are never checked.
 
 ## How it works
 
 1. **Linked pull requests.** Reads the issue's timeline for merged pull requests in the same repository that reference it and were merged after it was opened.
 2. **Grade the reference.** Reads how each pull request refers to the issue: "Fixes #N" claims a fix, "Part of #N" or "Related to #N" claims partial progress, and anything else is a mention. A pull request merged before the issue was last reopened is marked as not enough.
-3. **Title search.** Only when no linked pull request claims a fix or progress: searches merged pull requests for the most specific words in the issue title. These matches are never drafted.
+3. **Title search.** Only when no linked pull request claims a fix or progress: searches the titles of pull requests merged after the report for its most specific words, then, with `--verify`, for the model's suggested words. These matches are drafted only as a question, and only if the model finds the diff relevant.
 4. **First release.** Finds the earliest published, non-prerelease release after the merge whose tag contains the merge commit.
 5. **Draft.** Writes a reply citing the pull request and release. A partial fix gets a question ("is something still missing?") instead of a suggestion to close.
 
@@ -72,10 +78,11 @@ Scanning the 25 oldest open issues of a large open-source agent platform turned 
 - Each issue costs several API calls (timeline, each linked pull request, release comparisons), so a scan of 25 issues takes about a minute. The title search uses GitHub's search API, which allows 30 requests a minute.
 - Without `--verify`, reference grading reads wording, not code. It's a filter that decides what's worth a human's time, not a verdict. With `--verify`, a model's verdict is still for the maintainer to weigh, which is why it's shown next to the draft rather than hidden in it.
 - `--verify` sends issue text, PR descriptions and diffs to the model provider you choose. For a private repository, use a local model.
+- How often model-suggested searches find the real fix hasn't been measured yet. Searching is title-only: matching words in the body drowned the real fix in noise on a large repository.
 
 ## Roadmap
 
-- GitHub Discussions (Q&A) as well as issues
+- Measure how often suggested searches find the real fix, on issues whose fix is known
 - A GitHub Action that posts the report as a weekly maintainer digest, still never replying on its own
 - Flag accidental closing keywords, such as "which closed #123" in a PR description
 

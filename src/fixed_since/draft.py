@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fixed_since.finder import Candidate
+from fixed_since.finder import SEARCH_EVIDENCE, Candidate
 from fixed_since.github import Issue
 
 _EVIDENCE_LABEL = {
     "claims-fix": "the pull request says it fixes this issue",
     "partial": "the pull request says it is part of, or related to, this issue",
     "title-search": "title search only; check the diff",
+    "model-search": "found by a model-suggested title search; check the diff",
     "reopened-after": "the issue was reopened after this merged, so it was not enough",
     "mention": "the pull request only mentions this issue",
 }
@@ -28,7 +29,7 @@ def draft_kind(candidate: Candidate) -> DraftKind | None:
     outcome = candidate.verdict.outcome if candidate.verdict else None
     if candidate.evidence in ("mention", "reopened-after") or outcome == "unrelated":
         return None
-    if candidate.evidence == "title-search":
+    if candidate.evidence in SEARCH_EVIDENCE:
         return "ask" if outcome in ("addresses", "partial") else None
     if candidate.evidence == "partial" or outcome == "partial":
         return "ask"
@@ -57,7 +58,7 @@ def draft_reply(candidate: Candidate) -> str | None:
             f"If you still see this{since}, could you say which version you're running? "
             "Otherwise this can probably be closed."
         )
-    elif candidate.evidence == "title-search":
+    elif candidate.evidence in SEARCH_EVIDENCE:
         opening = f"{cited} changed this area and may cover it. {shipped}"
         ask = (
             f"Could you check whether things work for you{since}, or whether something is missing?"
@@ -92,7 +93,10 @@ def render_report(results: list[tuple[Issue, list[Candidate]]]) -> str:
     likely = [(i, c) for i, c in results if _best_draftable(c) is not None]
     weak = [(i, c) for i, c in results if c and _best_draftable(c) is None]
 
-    out = [f"# fixed-since: {len(likely)} of {len(results)} issues have a likely fix", ""]
+    noun = (
+        "discussions" if results and all(i.kind == "discussion" for i, _ in results) else "issues"
+    )
+    out = [f"# fixed-since: {len(likely)} of {len(results)} {noun} have a likely fix", ""]
     for issue, candidates in likely:
         out.append(f"## [#{issue.number}]({issue.url}) {issue.title}")
         out.append(f"Opened {issue.created_at.date().isoformat()}.")
@@ -110,11 +114,21 @@ def render_report(results: list[tuple[Issue, list[Candidate]]]) -> str:
     if weak:
         out.append("## Weak matches, no draft")
         out.append("")
-        out.append("These have related merged pull requests, but none is a likely fix.")
+        out.append(
+            "These have related merged pull requests, but none is a likely fix. "
+            "Search matches stay here unless --verify finds the diff relevant."
+        )
         out.append("")
         for issue, candidates in weak:
             out.append(f"### [#{issue.number}]({issue.url}) {issue.title}")
             for candidate in candidates:
                 out.extend(_candidate_lines(candidate))
             out.append("")
+
+    unmatched = [issue for issue, candidates in results if not candidates]
+    if unmatched:
+        out.append("## Nothing found")
+        out.append("")
+        out.extend(f"- [#{issue.number}]({issue.url}) {issue.title}" for issue in unmatched)
+        out.append("")
     return "\n".join(out)

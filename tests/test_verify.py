@@ -209,6 +209,36 @@ def test_anthropic_request_and_response() -> None:
     assert body["system"] == verify.SYSTEM_PROMPT and body["temperature"] == 0
 
 
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_both_clients_plan_searches_with_the_query_prompt(provider: str) -> None:
+    sent: list[dict] = []
+    answer = '["refresh credential", "repo:evil/x token"]'
+
+    def server(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        if provider == "openai":
+            return httpx.Response(200, json={"choices": [{"message": {"content": answer}}]})
+        return httpx.Response(200, json={"content": [{"type": "text", "text": answer}]})
+
+    transport = httpx.MockTransport(server)
+    model = (
+        OpenAICompatibleVerifier("m", "k", transport=transport)
+        if provider == "openai"
+        else AnthropicVerifier("m", "k", transport=transport)
+    )
+    assert model.suggest_queries(ISSUE) == ["refresh credential", "token"]
+    (body,) = sent
+    system = body["messages"][0]["content"] if provider == "openai" else body["system"]
+    assert system == verify.QUERY_SYSTEM_PROMPT
+    assert ISSUE.title in json.dumps(body)
+
+
+def test_prompt_printer_shows_the_query_prompt_and_suggests_nothing() -> None:
+    stream = io.StringIO()
+    assert PromptPrinter(stream).suggest_queries(ISSUE) == []
+    assert ISSUE.title in stream.getvalue()
+
+
 def test_a_refused_request_is_a_verifier_error() -> None:
     def server(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": "bad key"})
@@ -233,22 +263,31 @@ def test_prompt_printer_shows_the_prompt_and_calls_nothing() -> None:
     assert "[system]" in stream.getvalue() and "## Issue #1" in stream.getvalue()
 
 
-def test_only_the_strongest_verifiable_candidates_are_checked() -> None:
+def test_checks_are_capped_per_kind_of_evidence() -> None:
     def files(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[{"filename": "a.py", "patch": "+a"}])
 
     client = GitHubClient("acme/widget", transport=httpx.MockTransport(files))
     candidates = [
         _candidate("claims-fix"),
-        _candidate("mention"),
-        _candidate("partial"),
         _candidate("title-search"),
+        _candidate("title-search"),
+        _candidate("title-search"),  # third of its kind: over the cap
+        _candidate("model-search"),  # still checked despite the noisy title searches
         _candidate("reopened-after"),
-        _candidate("title-search"),
+        _candidate("mention"),
     ]
     stub = StubVerifier()
-    checked = verify_candidates(client, ISSUE, candidates, stub, max_per_issue=3)
-    assert [c.verdict is not None for c in checked] == [True, False, True, True, False, False]
+    checked = verify_candidates(client, ISSUE, candidates, stub, max_per_evidence=2)
+    assert [c.verdict is not None for c in checked] == [
+        True,
+        True,
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
     assert stub.requests[0].files == [ChangedFile("a.py", "+a")]
 
 
